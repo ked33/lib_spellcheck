@@ -55,6 +55,7 @@ public:
 	};
 	void process(Request request);
 	void notify(HighlightProcessId id);
+	void release();
 
 private:
 	using Task = std::variant<Request, HighlightProcessId>;
@@ -190,6 +191,10 @@ void QueuedHighlighter::notify(HighlightProcessId id) {
 	});
 }
 
+void QueuedHighlighter::release() {
+	_highlighter.reset();
+}
+
 struct CacheResult {
 	uint64 hash = 0;
 	const EntitiesInText *list = nullptr;
@@ -307,6 +312,18 @@ HighlightProcessId TryHighlightSyntax(TextWithEntities &text) {
 
 rpl::producer<HighlightProcessId> HighlightReady() {
 	return ReadyStream.events();
+}
+
+void ReleaseSyntaxHighlighting(Fn<void()> done) {
+	Expects(done != nullptr);
+
+	Cache.clear();
+	CacheOrder.clear();
+	Highlighter().with([done = std::move(done)](
+			QueuedHighlighter &instance) mutable {
+		instance.release();
+		crl::on_main(std::move(done));
+	});
 }
 
 } // namespace Spellchecker

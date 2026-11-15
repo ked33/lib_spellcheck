@@ -7,6 +7,7 @@
 #pragma once
 
 #include "ui/text/text_entity.h"
+#include "base/basic_types.h"
 
 namespace Spellchecker {
 
@@ -15,5 +16,6 @@ using HighlightProcessId = uint64;
 // Returning zero means we highlighted everything already.
 [[nodiscard]] HighlightProcessId TryHighlightSyntax(TextWithEntities &text);
 [[nodiscard]] rpl::producer<HighlightProcessId> HighlightReady();
+void ReleaseSyntaxHighlighting(Fn<void()> done);
 
 } // namespace Spellchecker
