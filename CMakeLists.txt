@@ -10,13 +10,8 @@ init_target(lib_spellcheck)
 
 get_filename_component(src_loc . REALPATH)
 
-set(use_enchant 0)
-if (LINUX AND DESKTOP_APP_USE_ENCHANT)
-    set(use_enchant 1)
-endif()
-
 set(system_spellchecker 0)
-if ((APPLE OR WIN32 OR use_enchant) AND NOT DESKTOP_APP_USE_HUNSPELL_ONLY)
+if (NOT DESKTOP_APP_USE_HUNSPELL_ONLY)
     set(system_spellchecker 1)
 endif()
 
@@ -112,14 +107,21 @@ else()
     )
 endif()
 
-# We should support both types of spellchecker for Windows.
-if (WIN32 OR NOT system_spellchecker)
+# We should support both types of spellchecker for Windows and Linux.
+if (WIN32 OR LINUX OR NOT system_spellchecker)
     target_link_libraries(lib_spellcheck PRIVATE desktop-app::external_hunspell)
     target_compile_definitions(lib_spellcheck PRIVATE SPELLCHECK_HAVE_HUNSPELL)
 else()
     remove_target_sources(lib_spellcheck ${src_loc}
         spellcheck/third_party/hunspell_controller.cpp
         spellcheck/third_party/hunspell_controller.h
+    )
+endif()
+
+# Enchant does its asynchronous work on the Hunspell queue itself.
+if (LINUX AND system_spellchecker)
+    remove_target_sources(lib_spellcheck ${src_loc}
+        spellcheck/platform/platform_spellcheck_async.cpp
     )
 endif()
 
@@ -140,10 +142,3 @@ PRIVATE
     desktop-app::external_gsl
     desktop-app::external_xxhash
 )
-
-if (LINUX AND use_enchant)
-    find_package(PkgConfig REQUIRED)
-
-    pkg_search_module(DESKTOP_APP_ENCHANT REQUIRED enchant-2 enchant)
-    target_include_directories(lib_spellcheck SYSTEM PRIVATE ${DESKTOP_APP_ENCHANT_INCLUDE_DIRS})
-endif()

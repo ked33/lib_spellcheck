@@ -1,248 +1,183 @@
 // This file is part of Desktop App Toolkit,
 // a set of libraries for developing nice desktop applications.
 //
-// Author: Nicholas Guriev <guriev-ns@ya.ru>, public domain, 2019
-// License: CC0, https://creativecommons.org/publicdomain/zero/1.0/legalcode
+// For license and copyright information please follow this link:
+// https://github.com/desktop-app/legal/blob/master/LEGAL
+//
 
-#include <mutex>
-#include <set>
-#include <QLocale>
+#include <future>
 
 #include "spellcheck/platform/linux/linux_enchant.h"
 
 #include "spellcheck/platform/linux/spellcheck_linux.h"
-#include "base/debug_log.h"
+#include "spellcheck/third_party/hunspell_controller.h"
 
 namespace Platform::Spellchecker {
 namespace {
 
-constexpr auto kHspell = "hspell";
-constexpr auto kMySpell = "myspell";
-constexpr auto kHunspell = "hunspell";
-constexpr auto kOrdering = "hspell,aspell,hunspell,myspell";
-constexpr auto kMaxValidators = 10;
-constexpr auto kMaxMySpellCount = 3;
-constexpr auto kMaxWordLength = 15;
-
-using DictPtr = std::unique_ptr<enchant::Dict>;
-
-auto CheckProvider(DictPtr &validator, const std::string &provider) {
-	auto p = validator->get_provider_name();
-	std::transform(begin(p), end(p), begin(p), ::tolower);
-	return (p.find(provider) == 0); // startsWith.
-}
-
-auto IsHebrew(const QString &word) {
-	// Words with mixed scripts will be automatically ignored,
-	// so this check should be fine.
-	return ::Spellchecker::WordScript(word) == QChar::Script_Hebrew;
-}
+std::vector<QString> ActiveLanguagesMirror;
 
 class EnchantSpellChecker {
 public:
-	auto knownLanguages();
+	// Returns the languages left without a dictionary
+	std::vector<QString> updateLanguages(const std::vector<QString> &langs);
+	std::vector<QString> languages() const;
+	std::vector<QString> systemLanguages() const;
 	bool checkSpelling(const QString &word);
-	auto findSuggestions(const QString &word);
-	void addWord(const QString &wordToAdd);
-	void ignoreWord(const QString &word);
-	void removeWord(const QString &word);
-	bool isWordInDictionary(const QString &word);
+	std::vector<std::vector<QString>> suggestionSources(
+		const QString &wrongWord,
+		int generation);
 	static EnchantSpellChecker *instance();
 
 private:
-	EnchantSpellChecker();
+	struct Validator {
+		QString lang;
+		QChar::Script script = QChar::Script_Unknown;
+		std::unique_ptr<Enchant::Dictionary> dict;
+	};
+
+	EnchantSpellChecker() = default;
 	EnchantSpellChecker(const EnchantSpellChecker&) = delete;
 	EnchantSpellChecker& operator =(const EnchantSpellChecker&) = delete;
 
-	std::unique_ptr<enchant::Broker> _brokerHandle;
-	std::vector<DictPtr> _validators;
-
-	std::vector<not_null<enchant::Dict*>> _hspells;
-
-	std::mutex _mutex;
+	std::vector<Validator> _validators;
 };
 
-EnchantSpellChecker::EnchantSpellChecker() {
-	if (!enchant::loader::do_explicit_linking()) return;
-	std::set<std::string> langs;
-	_brokerHandle = std::make_unique<enchant::Broker>();
-	_brokerHandle->list_dicts([](
-			const char *language,
-			const char *provider,
-			const char *description,
-			const char *filename,
-			void *our_payload) {
-		static_cast<decltype(langs)*>(our_payload)->insert(language);
-	}, &langs);
-	_validators.reserve(langs.size());
-	try {
-		std::string langTag = QLocale::system().name().toStdString();
-		_brokerHandle->set_ordering(langTag, kOrdering);
-		_validators.push_back(DictPtr(_brokerHandle->request_dict(langTag)));
-		langs.erase(langTag);
-	} catch (const enchant::Exception &e) {
-		// no first dictionary found
-	}
-	auto mySpellCount = 0;
-	for (const std::string &language : langs) {
-		try {
-			_brokerHandle->set_ordering(language, kOrdering);
-			auto validator = DictPtr(_brokerHandle->request_dict(language));
-			if (!validator) {
-				continue;
-			}
-			if (CheckProvider(validator, kHspell)) {
-				_hspells.push_back(validator.get());
-			}
-			if (CheckProvider(validator, kMySpell)
-				|| CheckProvider(validator, kHunspell)) {
-				if (mySpellCount > kMaxMySpellCount) {
-					continue;
-				} else {
-					mySpellCount++;
-				}
-			}
-			_validators.push_back(std::move(validator));
-			if (_validators.size() > kMaxValidators) {
-				break;
-			}
-		} catch (const enchant::Exception &e) {
-			DEBUG_LOG(("Catch after request_dict: %1").arg(e.what()));
-		}
-	}
-}
-
+// Used on the Hunspell queue only
 EnchantSpellChecker *EnchantSpellChecker::instance() {
 	static EnchantSpellChecker capsule;
 	return &capsule;
 }
 
-auto EnchantSpellChecker::knownLanguages() {
-	std::lock_guard lock(_mutex);
-	return _validators | ranges::views::transform([](const auto &validator) {
-		return QString(validator->get_lang().c_str());
-	}) | ranges::to_vector;
-}
+std::vector<QString> EnchantSpellChecker::updateLanguages(
+		const std::vector<QString> &langs) {
+	_validators.erase(ranges::remove_if(_validators, [&](const auto &v) {
+		return !ranges::contains(langs, v.lang);
+	}), end(_validators));
 
-bool EnchantSpellChecker::checkSpelling(const QString &word) {
-	std::lock_guard lock(_mutex);
-	auto w = word.toStdString();
-
-	const auto checkWord = [&](const auto &validator, auto w) {
-		try {
-			return validator->check(w);
-		} catch (const enchant::Exception &e) {
-			DEBUG_LOG(("Catch after check '%1': %2").arg(word, e.what()));
-			return true;
-		}
-	};
-
-	if (IsHebrew(word) && _hspells.size()) {
-		return ranges::any_of(_hspells, [&](const auto &validator) {
-			return checkWord(validator, w);
-		});
-	}
-	return ranges::any_of(_validators, [&](const auto &validator) {
-		// Hspell is the spell checker that only checks words in Hebrew.
-		// It returns 'true' for any non-Hebrew word,
-		// so we should skip Hspell if a word is not in Hebrew.
-		if (ranges::any_of(_hspells, [&](auto &v) {
-				return v == validator.get();
-			})) {
-			return false;
-		}
-		if (validator->get_lang().find("uk") == 0) {
-			return false;
-		}
-		return checkWord(validator, w);
-	}) || _validators.empty();
-}
-
-auto EnchantSpellChecker::findSuggestions(const QString &word) {
-	std::lock_guard lock(_mutex);
-	const auto wordScript = ::Spellchecker::WordScript(word);
-	auto w = word.toStdString();
-	std::vector<QString> result;
-	if (!_validators.size()) {
-		return result;
-	}
-
-	const auto convertSuggestions = [&](auto suggestions) {
-		for (const auto &replacement : suggestions) {
-			if (result.size() >= kMaxSuggestions) {
-				break;
-			}
-			if (!replacement.empty()) {
-				result.push_back(replacement.c_str());
-			}
-		}
-	};
-
-	if (word.size() >= kMaxWordLength) {
-		// The first element is the validator of the system language.
-		auto *v = _validators[0].get();
-		const auto lang = QString::fromStdString(v->get_lang());
-		if (wordScript == ::Spellchecker::LocaleToScriptCode(lang)) {
-			convertSuggestions(v->suggest(w));
-		}
-		return result;
-	}
-
-	if (IsHebrew(word) && _hspells.size()) {
-		for (const auto &h : _hspells) {
-			convertSuggestions(h->suggest(w));
-			if (result.size()) {
-				return result;
-			}
-		}
-	}
-	for (const auto &validator : _validators) {
-		const auto lang = QString::fromStdString(validator->get_lang());
-		if (wordScript != ::Spellchecker::LocaleToScriptCode(lang)) {
+	auto result = std::vector<QString>();
+	for (const auto &lang : langs) {
+		if (ranges::contains(_validators, lang, &Validator::lang)) {
 			continue;
 		}
-		convertSuggestions(validator->suggest(w));
-		if (!result.empty()) {
-			break;
+		auto dict = Enchant::RequestDictionary(lang);
+		if (!dict) {
+			result.push_back(lang);
+			continue;
+		}
+		_validators.push_back({
+			.lang = lang,
+			.script = ::Spellchecker::LocaleToScriptCode(lang),
+			.dict = std::move(dict),
+		});
+	}
+	return result;
+}
+
+std::vector<QString> EnchantSpellChecker::languages() const {
+	return ranges::views::all(
+		_validators
+	) | ranges::views::transform(
+		&Validator::lang
+	) | ranges::to_vector;
+}
+
+std::vector<QString> EnchantSpellChecker::systemLanguages() const {
+	auto result = std::vector<QString>();
+	for (auto tag : Enchant::ListDictionaries()) {
+		tag.replace('-', '_');
+		const auto locale = QLocale(tag);
+		const auto name = locale.name();
+		// Variants like de_DE_frami come along with the plain dictionaries
+		const auto plain = tag.contains('_')
+			? (name == tag)
+			: name.startsWith(tag + '_');
+		if (locale.language() != QLocale::C
+			&& plain
+			&& !ranges::contains(result, name)) {
+			result.push_back(name);
 		}
 	}
 	return result;
 }
 
-void EnchantSpellChecker::addWord(const QString &wordToAdd) {
-	std::lock_guard lock(_mutex);
-	if (_validators.empty()) {
-		return;
-	}
-	auto word = wordToAdd.toStdString();
-	auto &&first = _validators.front();
-	first->add(word);
-	first->add_to_session(word);
-}
-
-void EnchantSpellChecker::ignoreWord(const QString &word) {
-	std::lock_guard lock(_mutex);
-	if (_validators.empty()) {
-		return;
-	}
-	_validators.front()->add_to_session(word.toStdString());
-}
-
-void EnchantSpellChecker::removeWord(const QString &word) {
-	std::lock_guard lock(_mutex);
-	auto w = word.toStdString();
-	for (const auto &validator : _validators) {
-		validator->remove_from_session(w);
-		validator->remove(w);
-	}
-}
-
-bool EnchantSpellChecker::isWordInDictionary(const QString &word) {
-	std::lock_guard lock(_mutex);
-	auto w = word.toStdString();
-	return ranges::any_of(_validators, [&w](const auto &validator) {
-		return validator->is_added(w);
+bool EnchantSpellChecker::checkSpelling(const QString &word) {
+	const auto script = ::Spellchecker::WordScript(word);
+	return ranges::any_of(_validators, [&](const Validator &validator) {
+		return (validator.script == script) && validator.dict->check(word);
 	});
+}
+
+std::vector<std::vector<QString>> EnchantSpellChecker::suggestionSources(
+		const QString &wrongWord,
+		int generation) {
+	const auto script = ::Spellchecker::WordScript(wrongWord);
+	auto result = std::vector<std::vector<QString>>();
+	const auto startTime = crl::now();
+	for (const auto &validator : _validators) {
+		if (ThirdParty::IsLookupObsolete(generation)) {
+			return {};
+		}
+		if ((crl::now() - startTime) > ThirdParty::kTimeLimitSuggestion) {
+			break;
+		}
+		if (validator.script != script) {
+			continue;
+		}
+		const auto guesses = validator.dict->suggest(wrongWord);
+		result.push_back(ranges::views::all(
+			guesses
+		) | ranges::views::filter([](const QString &guess) {
+			return !guess.isEmpty();
+		}) | ranges::views::take(
+			kMaxSuggestions
+		) | ranges::to_vector);
+	}
+	return result;
+}
+
+[[nodiscard]] bool Check(
+		ThirdParty::HunspellService &hunspell,
+		const QString &word) {
+	return hunspell.checkSpelling(word)
+		|| EnchantSpellChecker::instance()->checkSpelling(word);
+}
+
+[[nodiscard]] MisspelledWords CheckText(
+		ThirdParty::HunspellService &hunspell,
+		const QString &text) {
+	return ::Spellchecker::RangesFromText(text, [&](const QString &word) {
+		return !::Spellchecker::IsWordSkippable(word)
+			&& Check(hunspell, word);
+	});
+}
+
+[[nodiscard]] std::vector<QString> Suggestions(
+		ThirdParty::HunspellService &hunspell,
+		const QString &word,
+		int generation) {
+	if (ThirdParty::IsLookupObsolete(generation)) {
+		return {};
+	}
+	auto sources = hunspell.suggestionSources(word, generation);
+	for (auto &source : EnchantSpellChecker::instance()->suggestionSources(
+			word,
+			generation)) {
+		sources.push_back(std::move(source));
+	}
+	return ThirdParty::InterleaveSuggestions(sources);
+}
+
+template <typename Callback>
+auto RunOnQueue(Callback callback) {
+	using Result = decltype(
+		callback(std::declval<ThirdParty::HunspellService&>()));
+	auto promise = std::promise<Result>();
+	auto future = promise.get_future();
+	ThirdParty::Queue().with([&](ThirdParty::HunspellService &hunspell) {
+		promise.set_value(callback(hunspell));
+	});
+	return future.get();
 }
 
 } // namespace
@@ -251,55 +186,126 @@ void Init() {
 }
 
 std::vector<QString> ActiveLanguages() {
-	return EnchantSpellChecker::instance()->knownLanguages();
+	return ActiveLanguagesMirror;
 }
 
 void UpdateLanguages(std::vector<int> languages) {
-	::Spellchecker::UpdateSupportedScripts(ActiveLanguages());
-	crl::async([=] {
-		const auto result = ActiveLanguages();
-		crl::on_main([=] {
-			::Spellchecker::UpdateSupportedScripts(result);
+	auto codes = ranges::views::all(
+		languages
+	) | ranges::views::transform([](int langId) {
+		return ::Spellchecker::LocaleFromLangId(langId).name();
+	}) | ranges::to_vector;
+
+	::Spellchecker::UpdateSupportedScripts(std::vector<QString>());
+	ThirdParty::Queue().with([codes = std::move(codes)](
+			ThirdParty::HunspellService &hunspell) {
+		const auto instance = EnchantSpellChecker::instance();
+		crl::on_main([system = instance->systemLanguages()]() mutable {
+			::Spellchecker::UpdateSystemDictionaries(std::move(system));
+		});
+		const auto rest = instance->updateLanguages(codes);
+		auto loaded = instance->languages();
+		for (auto &lang : hunspell.updateLanguages(rest)) {
+			loaded.push_back(std::move(lang));
+		}
+		crl::on_main([loaded = std::move(loaded)]() mutable {
+			ActiveLanguagesMirror = loaded;
+			::Spellchecker::UpdateSupportedScripts(std::move(loaded));
 		});
 	});
 }
 
 bool CheckSpelling(const QString &wordToCheck) {
-	return EnchantSpellChecker::instance()->checkSpelling(wordToCheck);
+	return RunOnQueue([&](ThirdParty::HunspellService &hunspell) {
+		return Check(hunspell, wordToCheck);
+	});
 }
 
 void FillSuggestionList(
 		const QString &wrongWord,
 		std::vector<QString> *variants) {
-	*variants = EnchantSpellChecker::instance()->findSuggestions(wrongWord);
+	const auto generation = ThirdParty::NextLookupGeneration();
+	*variants = RunOnQueue([&](ThirdParty::HunspellService &hunspell) {
+		return Suggestions(hunspell, wrongWord, generation);
+	});
 }
 
 void AddWord(const QString &word) {
-	EnchantSpellChecker::instance()->addWord(word);
+	ThirdParty::AddWord(word);
 }
 
 void RemoveWord(const QString &word) {
-	EnchantSpellChecker::instance()->removeWord(word);
+	ThirdParty::RemoveWord(word);
 }
 
 void IgnoreWord(const QString &word) {
-	EnchantSpellChecker::instance()->ignoreWord(word);
+	ThirdParty::IgnoreWord(word);
 }
 
 bool IsWordInDictionary(const QString &wordToCheck) {
-	return EnchantSpellChecker::instance()->isWordInDictionary(wordToCheck);
+	return ThirdParty::IsWordInDictionary(wordToCheck);
 }
 
 void CheckSpellingText(
 		const QString &text,
 		MisspelledWords *misspelledWords) {
-	*misspelledWords = ::Spellchecker::RangesFromText(
-		text,
-		::Spellchecker::CheckSkipAndSpell);
+	*misspelledWords = RunOnQueue([&](ThirdParty::HunspellService &hunspell) {
+		return CheckText(hunspell, text);
+	});
+}
+
+void CheckSpelling(QString word, FnMut<void(bool correct)> callback) {
+	ThirdParty::Queue().with([
+		word = std::move(word),
+		callback = std::move(callback)
+	](ThirdParty::HunspellService &hunspell) mutable {
+		const auto correct = Check(hunspell, word);
+		crl::on_main([correct, callback = std::move(callback)]() mutable {
+			callback(correct);
+		});
+	});
+}
+
+void CheckSpellingText(
+		QString text,
+		FnMut<void(MisspelledWords &&)> callback) {
+	ThirdParty::Queue().with([
+		text = std::move(text),
+		callback = std::move(callback)
+	](ThirdParty::HunspellService &hunspell) mutable {
+		auto misspelled = CheckText(hunspell, text);
+		crl::on_main([
+			misspelled = std::move(misspelled),
+			callback = std::move(callback)]() mutable {
+			callback(std::move(misspelled));
+		});
+	});
+}
+
+void LookupWord(
+		QString word,
+		FnMut<void(bool correct, std::vector<QString> &&)> callback) {
+	const auto generation = ThirdParty::NextLookupGeneration();
+	ThirdParty::Queue().with([
+		generation,
+		word = std::move(word),
+		callback = std::move(callback)
+	](ThirdParty::HunspellService &hunspell) mutable {
+		const auto correct = Check(hunspell, word);
+		auto suggestions = correct
+			? std::vector<QString>()
+			: Suggestions(hunspell, word, generation);
+		crl::on_main([
+			correct,
+			suggestions = std::move(suggestions),
+			callback = std::move(callback)]() mutable {
+			callback(correct, std::move(suggestions));
+		});
+	});
 }
 
 bool IsSystemSpellchecker() {
-	return true;
+	return false;
 }
 
 } // namespace Platform::Spellchecker
